@@ -1,0 +1,33 @@
+<launch>
+
+    <!-- Параметры -->
+    <arg name="image_folder" default="/home/$(env USER)/images"/>
+    <arg name="rate" default="10"/>
+
+    <!-- Публикатор изображений -->
+    <node
+        pkg="image_folder_publisher"
+        type="folder_image_node.py"
+        name="image_publisher"
+        output="screen">
+
+        <param name="folder" value="$(arg image_folder)"/>
+        <param name="rate" value="$(arg rate)"/>
+
+    </node>
+
+    <!-- Обработка изображений -->
+    <node
+        pkg="image_folder_publisher"
+        type="image_processing_node.py"
+        name="image_processing"
+        output="screen"/>
+
+    <!-- PID контроллер -->
+    <node
+        pkg="image_folder_publisher"
+        type="controller_node.py"
+        name="pid_controller"
+        output="screen"/>
+
+</launch>
