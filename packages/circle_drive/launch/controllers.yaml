@@ -1,0 +1,22 @@
+controller_type: pid
+
+max_linear_velocity: 0.25
+max_angular_velocity: 8.0
+
+kp_horizontal: 2.0
+ki_horizontal: 0.0
+kd_horizontal: 0.5
+
+kp_angular: 4.9
+ki_angular: 0.0
+kd_angular: 0.5
+
+lqr_k_horizontal: 2.5
+lqr_k_angular: 2.0
+
+mpc_horizon: 15
+mpc_dt: 0.1
+mpc_q_h: 4.0
+mpc_q_a: 2.0
+mpc_r: 0.3
+mpc_candidates: 31
