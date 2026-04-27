@@ -220,6 +220,108 @@ class ImageProcessingNode(DTROS):
 
         self.bridge = CvBridge()
         self.frame_id = 0
+
+         # ==================================================
+        # Common params
+        # ==================================================
+        self.controller_type = rospy.get_param("~controller_type", "pid")
+
+        self.max_linear_velocity = rospy.get_param(
+            "~max_linear_velocity", 0.2
+        )
+        self.max_angular_velocity = rospy.get_param(
+            "~max_angular_velocity", 8.0
+        )
+
+        # ==================================================
+        # PID params
+        # ==================================================
+        self.kp_horizontal = rospy.get_param("~kp_horizontal", 2.0)
+        self.ki_horizontal = rospy.get_param("~ki_horizontal", 0.0)
+        self.kd_horizontal = rospy.get_param("~kd_horizontal", 0.5)
+
+        self.kp_angular = rospy.get_param("~kp_angular", 4.9)
+        self.ki_angular = rospy.get_param("~ki_angular", 0.0)
+        self.kd_angular = rospy.get_param("~kd_angular", 0.5)
+
+        # ==================================================
+        # LQR params
+        # ==================================================
+        self.lqr_k_horizontal = rospy.get_param(
+            "~lqr_k_horizontal", 2.5
+        )
+        self.lqr_k_angular = rospy.get_param(
+            "~lqr_k_angular", 2.0
+        )
+
+        # ==================================================
+        # MPC params
+        # ==================================================
+        self.mpc_horizon = rospy.get_param("~mpc_horizon", 15)
+        self.mpc_dt = rospy.get_param("~mpc_dt", 0.1)
+
+        self.mpc_q_h = rospy.get_param("~mpc_q_h", 4.0)
+        self.mpc_q_a = rospy.get_param("~mpc_q_a", 2.0)
+        self.mpc_r = rospy.get_param("~mpc_r", 0.3)
+
+        self.mpc_candidates = rospy.get_param(
+            "~mpc_candidates", 31
+        )
+
+        # ==================================================
+        # Controller selection
+        # ==================================================
+        if self.controller_type == "pid":
+            self.regulator = PIDController(
+                kp_horizontal=self.kp_horizontal,
+                ki_horizontal=self.ki_horizontal,
+                kd_horizontal=self.kd_horizontal,
+
+                kp_angular=self.kp_angular,
+                ki_angular=self.ki_angular,
+                kd_angular=self.kd_angular,
+
+                max_linear_velocity=self.max_linear_velocity,
+                max_angular_velocity=self.max_angular_velocity
+            )
+
+        elif self.controller_type == "lqr":
+            self.regulator = LQRController(
+                max_linear_velocity=self.max_linear_velocity,
+                max_angular_velocity=self.max_angular_velocity
+            )
+
+            self.regulator.K = np.array([
+                self.lqr_k_horizontal,
+                self.lqr_k_angular
+            ])
+
+        elif self.controller_type == "mpc":
+            self.regulator = MPCController(
+                horizon=self.mpc_horizon,
+                dt=self.mpc_dt,
+                max_linear_velocity=self.max_linear_velocity,
+                max_angular_velocity=self.max_angular_velocity
+            )
+
+            self.regulator.candidates = np.linspace(
+                -self.max_angular_velocity,
+                self.max_angular_velocity,
+                self.mpc_candidates
+            )
+
+            self.regulator.q_h = self.mpc_q_h
+            self.regulator.q_a = self.mpc_q_a
+            self.regulator.r = self.mpc_r
+
+        else:
+            raise ValueError(
+                f"Unknown controller_type: {self.controller_type}"
+            )
+
+        rospy.loginfo(
+            f"Loaded controller: {self.controller_type}"
+        )
         self.sub = rospy.Subscriber("/autobot05/camera_node/image/compressed", CompressedImage, self.callback, queue_size=1)
         self.pub_debug = rospy.Publisher("/lane_debug", Image, queue_size=1)
         self.pub_state = rospy.Publisher("/lane_state", Vector3, queue_size=1)
@@ -229,16 +331,16 @@ class ImageProcessingNode(DTROS):
         self.yellow = None
         self.white = None
 
-        self.pid = PIDController(
-            kp_horizontal=2.0,
-            ki_horizontal=0,
-            kd_horizontal=0.5,
-            kp_angular=4.9,
-            ki_angular=0,
-            kd_angular=0.5,
-            max_linear_velocity=0.2, #0.25
-            max_angular_velocity=8 #1.5
-        )
+        #self.pid = PIDController(
+        #    kp_horizontal=2.0,
+        #    ki_horizontal=0,
+        #    kd_horizontal=0.5,
+        #    kp_angular=4.9,
+        #    ki_angular=0,
+        #    kd_angular=0.5,
+        #    max_linear_velocity=0.2, #0.25
+        #    max_angular_velocity=8 #1.5
+        #)
         self.process_times = []
         self.control_times = []
         #self.pid = PIDController(
