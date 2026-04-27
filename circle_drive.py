@@ -426,7 +426,7 @@ class ImageProcessingNode(DTROS):
             msg.omega = 0.0
             self.pub.publish(msg)
         else:
-            v, w = self.pid.update(horizontal_error, angular_error)
+            v, w = self.regulator.update(horizontal_error, angular_error)
             msg.v = v
             msg.omega = w
             self.pub.publish(msg)
