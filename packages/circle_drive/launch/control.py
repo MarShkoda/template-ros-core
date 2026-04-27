@@ -15,14 +15,17 @@ class MPCController:
         h = h0
         a = a0
         cost = 0.0
-
+    
         for _ in range(self.N):
             a = a - omega * self.dt
             h = h + a * self.dt
-
-            #cost += 4*h*h + 2*a*a + 0.05*omega*omega
-            cost += 4*h*h + 2*a*a + 0.3*omega*omega
-
+    
+            cost += (
+                self.q_h * h * h +
+                self.q_a * a * a +
+                self.r * omega * omega
+            )
+    
         return cost
 
     def update(self, horizontal_error, angular_error):
