@@ -3,6 +3,7 @@ import rospy
 import cv2
 import numpy as np
 import math
+import time
 
 from sensor_msgs.msg import Image, CompressedImage
 from geometry_msgs.msg import Vector3
@@ -60,6 +61,11 @@ class ImageLineProcessingOptimized:
 
         self._roi_mask = None
         self.image = None
+        self.x1 = int(self.width * self.left)
+        self.x2 = int(self.width * self.right)
+
+        self.y1 = int(self.height * 0.35)
+        self.y2 = int(self.height * 0.95)
 
     def _get_roi_mask(self, target_shape=None):
         """Create ROI mask, optionally resizing to target shape"""
@@ -180,15 +186,12 @@ class ImageLineProcessingOptimized:
         return (x1,y1,x2,y2), float(vx/vy), float(x0 - (vx/vy)*y0)
 
     def process(self, image, frame_id=None):
-        self.image = cv2.blur(image, (3,3))
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(self.image, self.lower, self.upper)
-        #self.pub_debug_mask.publish(self.bridge.cv2_to_imgmsg(mask, encoding="mono8"))
-        roi = self.region_selection(mask)
-        #self.pub_debug_roi.publish(self.bridge.cv2_to_imgmsg(roi, encoding="mono8"))
-        _, binary = cv2.threshold(roi, 120, 255, cv2.THRESH_BINARY)
-
-        result = self.detect_line(roi, self.image, frame_id)
+        roi_rgb = image[self.y1:self.y2, self.x1:self.x2]
+        hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.lower, self.upper)
+        full_mask = np.zeros((self.height, self.width), dtype=np.uint8)
+        full_mask[self.y1:self.y2, self.x1:self.x2] = mask
+        result = self.detect_line(full_mask, hsv, frame_id)
         if result is None:
             return {"valid": False, "line": None, "k": None, "b": None}
 
@@ -236,7 +239,8 @@ class ImageProcessingNode(DTROS):
             max_linear_velocity=0.2, #0.25
             max_angular_velocity=8 #1.5
         )
-
+        self.process_times = []
+        self.control_times = []
         #self.pid = PIDController(
         #    kp_horizontal=0.008,
         #    ki_horizontal=0.0001,
@@ -265,10 +269,12 @@ class ImageProcessingNode(DTROS):
 
         center_x = 335 #w / 2
         bottom_y = int(h * 0.78)
-
+        tp = time.perf_counter()
         y_model = self.yellow.process(img)
         w_model = self.white.process(img)
-
+        process_time = (time.perf_counter() - tp) * 1000.0
+        self.process_times.append(process_time)
+      
         horizontal_error = 0.0
         angular_error = 0.0
         valid = False
@@ -299,12 +305,8 @@ class ImageProcessingNode(DTROS):
             valid = True
 
         
-
-        #if (horizontal_error < 10):
-        #    horizontal_error = 0
-        #horizontal_error *= 0.05
         horizontal_error = horizontal_error/w
-        if (abs(angular_error) < 0.001):
+        if (abs(angular_error) < 0.0001):
             angular_error = 0
         if (abs(horizontal_error) < 0.006): 
             horizontal_error = 0
@@ -316,6 +318,7 @@ class ImageProcessingNode(DTROS):
 
         msg = Twist2DStamped()
 
+        tc = time.perf_counter()
         if not valid:
             msg.v = 0.0
             msg.omega = 0.0
@@ -324,8 +327,9 @@ class ImageProcessingNode(DTROS):
             v, w = self.pid.update(horizontal_error, angular_error)
             msg.v = v
             msg.omega = w
-
             self.pub.publish(msg)
+        control_time = (time.perf_counter() - tc) * 1000.0
+        self.control_times.append(control_time)
         #rospy.loginfo("+++++++")
         #rospy.loginfo(f"he {horizontal_error:.2f} ae {angular_error:.2f}")    
         #rospy.loginfo(f"msg.omega {msg.omega:.2f} msg.v {msg.v:.2f}")
