@@ -7,12 +7,32 @@
         t1 = time.perf_counter()
 
         # ---------- RGB -> HSV ----------
-        hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+        roi = image[self.y1:self.y2, self.x1:self.x2]
+
+        r = roi[:,:,0]
+        g = roi[:,:,1]
+        b = roi[:,:,2]
+
 
         t2 = time.perf_counter()
 
         # ---------- MASK ----------
-        mask = cv2.inRange(hsv, self.lower, self.upper)
+        if self.color == ColorLine.yellow:
+            mask = (
+                (r > 140) &
+                (g > 120) &
+                (b < 130) &
+                (r > g)
+            ).astype(np.uint8) * 255
+        else:
+            mask = (
+                (r > 170) &
+                (g > 170) &
+                (b > 170) &
+                (np.abs(r-g) < 35) &
+                (np.abs(r-b) < 35) &
+                (np.abs(g-b) < 35)
+            ).astype(np.uint8) * 255
 
         t3 = time.perf_counter()
 
