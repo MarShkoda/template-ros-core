@@ -9,6 +9,7 @@ from sensor_msgs.msg import Image, CompressedImage
 from geometry_msgs.msg import Vector3
 from cv_bridge import CvBridge
 from nir import PIDController
+from controllers import MPCController
 from nir import ColorLine, warp_bird_eye
 from duckietown.dtros import DTROS, NodeType
 from duckietown_msgs.msg import Twist2DStamped
@@ -64,8 +65,17 @@ class ImageLineProcessingOptimized:
         self.x1 = int(self.width * self.left)
         self.x2 = int(self.width * self.right)
 
-        self.y1 = int(self.height * 0.35)
+        self.y1 = int(self.height * 0.45)
         self.y2 = int(self.height * 0.95)
+
+
+        roi_h = self.y2 - self.y1
+
+        self.scan_ys = np.linspace(
+            int(roi_h * 0.45),
+            int(roi_h * 0.95),
+            11
+        ).astype(int)
 
     def _get_roi_mask(self, target_shape=None):
         """Create ROI mask, optionally resizing to target shape"""
@@ -92,16 +102,12 @@ class ImageLineProcessingOptimized:
         return cv2.bitwise_and(color_mask, roi_mask)
 
     def detect_line(self, binary, orig_image=None, frame_id=None):
-        debug = True #self.pub_debug.get_num_connections() > 0
+        debug = rospy.get_param("/debug", 0) #self.pub_debug.get_num_connections() > 0
 
         if debug:
             dbg = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
 
-        ys = np.linspace(
-            int(self.height * 0.6),
-            int(self.height * 0.9),
-            9
-        ).astype(int)
+        ys = self.scan_ys
 
         pts = []
 
@@ -157,41 +163,121 @@ class ImageLineProcessingOptimized:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
             self.pub_debug.publish(self.bridge.cv2_to_imgmsg(dbg, "bgr8"))
 
-        # ---- Сохраняем для коллажа ----
-        """  if orig_image is not None and frame_id is not None and frame_id < 100:
-            # сохраняем в глобальный словарь
-            if frame_id not in collage_store:
-                collage_store[frame_id] = {}
-            if self.color == ColorLine.yellow:
-                collage_store[frame_id]["yellow"] = dbg
-            else:
-                collage_store[frame_id]["white"] = dbg
-            collage_store[frame_id]["orig"] = orig_image
-
-            # если все три изображения готовы, сохраняем коллаж
-            parts = collage_store[frame_id]
-            if all(k in parts for k in ["orig","yellow","white"]):
-                # делаем коллаж: ширина = 3*ширина, высота = высота
-                collage = np.zeros((self.height, self.width*3, 3), np.uint8)
-                collage[:, :self.width] = parts["yellow"]
-                collage[:, self.width:2*self.width] = parts["orig"]
-                collage[:, 2*self.width:] = parts["white"]
-                save_path = os.path.join(self.save_debug_dir, f"{frame_id:06d}.png")
-                cv2.imwrite(save_path, collage)
-                #rospy.loginfo(f"path {save_path}")
-                # удаляем из словаря, чтобы не переполнять память
-                del collage_store[frame_id] """ 
 
         #return (x1, y1), (x2, y2)
         return (x1,y1,x2,y2), float(vx/vy), float(x0 - (vx/vy)*y0)
+    def detect_line_fast(self, binary):
+        t0 = time.perf_counter()
+
+        h, w = binary.shape
+
+        ys = self.scan_ys
+
+        pts = []
+
+        for y in ys:
+            row = binary[y]
+
+            xs = cv2.findNonZero(row.reshape(1, -1))
+
+            if xs is None or len(xs) < 5:
+                continue
+
+            x = int(np.mean(xs[:, 0, 0]))
+            pts.append((x, y))
+
+        t1 = time.perf_counter()
+
+        if len(pts) < 2:
+            print(f"SCAN:{(t1-t0)*1000:.1f} ms | NO LINE")
+            return None
+
+        pts = np.array(pts, dtype=np.float32)
+
+        vx, vy, x0, y0 = cv2.fitLine(
+            pts,
+            cv2.DIST_L2,
+            0,
+            0.01,
+            0.01
+        )
+
+        vx, vy, x0, y0 = vx[0], vy[0], x0[0], y0[0]
+
+        if abs(vy) < 1e-5:
+            return None
+
+        y1 = int(h * 0.85)
+        y2 = int(h * 0.45)
+
+        x1 = int((y1 - y0) * vx / vy + x0)
+        x2 = int((y2 - y0) * vx / vy + x0)
+
+        k = float(vx / vy)
+        b = float(x0 - k * y0)
+
+        t2 = time.perf_counter()
+
+        #print(
+        #    f"SCAN:{(t1-t0)*1000:.1f} ms | "
+        #    f"FIT:{(t2-t1)*1000:.1f} ms"
+        #)
+
+        return (x1 + self.x1, y1 + self.y1,
+                x2 + self.x1, y2 + self.y1), k, b
 
     def process(self, image, frame_id=None):
-        roi_rgb = image[self.y1:self.y2, self.x1:self.x2]
-        hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.lower, self.upper)
-        full_mask = np.zeros((self.height, self.width), dtype=np.uint8)
-        full_mask[self.y1:self.y2, self.x1:self.x2] = mask
-        result = self.detect_line(full_mask, hsv, frame_id)
+        t0 = time.perf_counter()
+
+        # ---------- ROI ----------
+        roi = image[self.y1:self.y2, self.x1:self.x2]
+
+        t1 = time.perf_counter()
+
+        # ---------- RGB -> HSV ----------
+
+        # b = roi[:,:,0]
+        # g = roi[:,:,1]
+        # r = roi[:,:,2]
+
+
+        t2 = time.perf_counter()
+
+        # ---------- MASK ----------
+        if self.color == ColorLine.yellow:
+            mask = cv2.inRange(roi,
+            np.array([0, 120,140], dtype = np.uint8),
+            np.array([140, 255, 255], dtype = np.uint8)
+            )
+        else:
+            mask = cv2.inRange(roi,
+            np.array([170, 170, 170], dtype = np.uint8),
+            np.array([255, 255, 255], dtype = np.uint8)
+            )
+
+
+        t3 = time.perf_counter()
+
+        # ---------- LINE DETECTION ----------
+        result = self.detect_line_fast(mask)
+
+        t4 = time.perf_counter()
+
+        # ---------- TIMING ----------
+        total = (t4 - t0) * 1000
+        roi_t = (t1 - t0) * 1000
+        hsv_t = (t2 - t1) * 1000
+        mask_t = (t3 - t2) * 1000
+        detect_t = (t4 - t3) * 1000
+
+        #print(
+        #    f"ROI:{roi_t:.1f} ms | "
+        #    f"HSV:{hsv_t:.1f} ms | "
+        #    f"MASK:{mask_t:.1f} ms | "
+        #    f"LINE:{detect_t:.1f} ms | "
+        #    f"TOTAL:{total:.1f} ms"
+        #)
+
         if result is None:
             return {"valid": False, "line": None, "k": None, "b": None}
 
@@ -224,7 +310,7 @@ class ImageProcessingNode(DTROS):
          # ==================================================
         # Common params
         # ==================================================
-        self.controller_type = rospy.get_param("~controller_type", "pid")
+        self.controller_type = rospy.get_param("/controller_type", "pid")
 
         self.max_linear_velocity = rospy.get_param(
             "~max_linear_velocity", 0.2
@@ -236,13 +322,13 @@ class ImageProcessingNode(DTROS):
         # ==================================================
         # PID params
         # ==================================================
-        self.kp_horizontal = rospy.get_param("~kp_horizontal", 2.0)
-        self.ki_horizontal = rospy.get_param("~ki_horizontal", 0.0)
-        self.kd_horizontal = rospy.get_param("~kd_horizontal", 0.5)
+        self.kp_horizontal = rospy.get_param("/kp_horizontal", 2.0)
+        self.ki_horizontal = rospy.get_param("/ki_horizontal", 0.0)
+        self.kd_horizontal = rospy.get_param("/kd_horizontal", 0.5)
 
-        self.kp_angular = rospy.get_param("~kp_angular", 4.9)
-        self.ki_angular = rospy.get_param("~ki_angular", 0.0)
-        self.kd_angular = rospy.get_param("~kd_angular", 0.5)
+        self.kp_angular = rospy.get_param("/kp_angular", 4.9)
+        self.ki_angular = rospy.get_param("/ki_angular", 0.0)
+        self.kd_angular = rospy.get_param("/kd_angular", 0.5)
 
         # ==================================================
         # LQR params
@@ -257,15 +343,15 @@ class ImageProcessingNode(DTROS):
         # ==================================================
         # MPC params
         # ==================================================
-        self.mpc_horizon = rospy.get_param("~mpc_horizon", 15)
-        self.mpc_dt = rospy.get_param("~mpc_dt", 0.1)
+        self.mpc_horizon = rospy.get_param("/mpc_horizon", 15)
+        self.mpc_dt = rospy.get_param("/mpc_dt", 0.1)
 
-        self.mpc_q_h = rospy.get_param("~mpc_q_h", 4.0)
-        self.mpc_q_a = rospy.get_param("~mpc_q_a", 2.0)
-        self.mpc_r = rospy.get_param("~mpc_r", 0.3)
+        self.mpc_q_h = rospy.get_param("/mpc_q_h", 4.0)
+        self.mpc_q_a = rospy.get_param("/mpc_q_a", 2.0)
+        self.mpc_r = rospy.get_param("/mpc_r", 0.3)
 
         self.mpc_candidates = rospy.get_param(
-            "~mpc_candidates", 31
+            "/mpc_candidates", 31
         )
 
         # ==================================================
@@ -284,7 +370,24 @@ class ImageProcessingNode(DTROS):
                 max_linear_velocity=self.max_linear_velocity,
                 max_angular_velocity=self.max_angular_velocity
             )
-
+            rospy.loginfo(
+                f"kp_horizontal: {self.kp_horizontal}"
+            )
+            rospy.loginfo(
+                f"ki_horizontal: {self.ki_horizontal}"
+            )
+            rospy.loginfo(
+                f"kd_horizontal: {self.kd_horizontal}"
+            )
+            rospy.loginfo(
+                f"kp_angular: {self.kp_angular}"
+            )
+            rospy.loginfo(
+                f"ki_angular: {self.ki_angular}"
+            )
+            rospy.loginfo(
+                f"kd_angular: {self.kd_angular}"
+            )
         elif self.controller_type == "lqr":
             self.regulator = LQRController(
                 max_linear_velocity=self.max_linear_velocity,
@@ -322,7 +425,8 @@ class ImageProcessingNode(DTROS):
         rospy.loginfo(
             f"Loaded controller: {self.controller_type}"
         )
-        self.sub = rospy.Subscriber("/autobot05/camera_node/image/compressed", CompressedImage, self.callback, queue_size=1)
+        
+        self.sub = rospy.Subscriber("/autobot06/camera_node/image/compressed", CompressedImage, self.callback, queue_size=1)
         self.pub_debug = rospy.Publisher("/lane_debug", Image, queue_size=1)
         self.pub_state = rospy.Publisher("/lane_state", Vector3, queue_size=1)
         self.pub = rospy.Publisher("~car_cmd", Twist2DStamped, queue_size=1)
@@ -330,7 +434,7 @@ class ImageProcessingNode(DTROS):
 
         self.yellow = None
         self.white = None
-
+        self.drive = rospy.get_param("/drive", 0)
         #self.pid = PIDController(
         #    kp_horizontal=2.0,
         #    ki_horizontal=0,
@@ -424,19 +528,24 @@ class ImageProcessingNode(DTROS):
         if not valid:
             msg.v = 0.0
             msg.omega = 0.0
-            self.pub.publish(msg)
+            
         else:
             v, w = self.regulator.update(horizontal_error, angular_error)
             msg.v = v
             msg.omega = w
-            self.pub.publish(msg)
+
+        if (self.drive):
+            self.pub.publish(msg)    
         control_time = (time.perf_counter() - tc) * 1000.0
         self.control_times.append(control_time)
         #rospy.loginfo("+++++++")
         #rospy.loginfo(f"he {horizontal_error:.2f} ae {angular_error:.2f}")    
         #rospy.loginfo(f"msg.omega {msg.omega:.2f} msg.v {msg.v:.2f}")
 
-
+        if (self.frame_id == 22 or self.frame_id == 21):
+            m_process = sum(self.process_times)/len(self.process_times)
+            m_control = sum(self.control_times)/len(self.control_times)
+            rospy.loginfo(f"m_process {m_process:.2f} m_control {m_control:.2f}")  
         dbg = self.yellow.draw(img, y_model, (0,255,255))
         dbg = self.white.draw(dbg, w_model, (255,255,255), int(lane_center), int(center_x))
         text_y = 40
