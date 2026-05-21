@@ -9,12 +9,12 @@ from sensor_msgs.msg import Image, CompressedImage
 from geometry_msgs.msg import Vector3
 from cv_bridge import CvBridge
 from nir import PIDController
-from controllers import MPCController
-from nir import ColorLine, warp_bird_eye
+from controllers import MPCController, LQRController
+from compute import HoughLineProcessing, SlidingWindowLineProcessing, ContourLineProcessing
+from nir import ColorLine
 from duckietown.dtros import DTROS, NodeType
 from duckietown_msgs.msg import Twist2DStamped
 
-collage_store = {}  # {frame_id: {"orig": img, "yellow": dbg_y, "white": dbg_w}}
 
 '''colors:
   RED:
@@ -77,95 +77,10 @@ class ImageLineProcessingOptimized:
             11
         ).astype(int)
 
-    def _get_roi_mask(self, target_shape=None):
-        """Create ROI mask, optionally resizing to target shape"""
-        if self._roi_mask is None:
-            mask = np.zeros((self.height, self.width), dtype=np.uint8)
-            vertices = np.array([[
-                (int(self.width * self.left),  int(self.height * 0.55)),
-                (int(self.width * self.left),  int(self.height * 0.95)),
-                (int(self.width * self.right), int(self.height * 0.95)),
-                (int(self.width * self.right), int(self.height * 0.55)),
-            ]], np.int32)
-            cv2.fillPoly(mask, vertices, 255)
-            self._roi_mask = mask
-        
-        # Resize mask if target shape is provided and different
-        if target_shape is not None:
-            if target_shape[:2] != self._roi_mask.shape[:2]:
-                return cv2.resize(self._roi_mask, (target_shape[1], target_shape[0]))
-        
-        return self._roi_mask
-
     def region_selection(self, color_mask):
         roi_mask = self._get_roi_mask(color_mask.shape)
         return cv2.bitwise_and(color_mask, roi_mask)
 
-    def detect_line(self, binary, orig_image=None, frame_id=None):
-        debug = rospy.get_param("/debug", 0) #self.pub_debug.get_num_connections() > 0
-
-        if debug:
-            dbg = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-
-        ys = self.scan_ys
-
-        pts = []
-
-        for y in ys:
-            row = binary[y]
-            xs = np.where(row > 0)[0]
-            if len(xs) < 10:
-                continue
-            x = int(np.median(xs))
-            pts.append((x, y))
-            if debug:
-                cv2.circle(dbg, (x, y), 4, (0,255,255), -1)
-
-        if len(pts) < 2:
-            if debug:
-                self.pub_debug.publish(self.bridge.cv2_to_imgmsg(dbg, "bgr8"))
-            return None
-
-        pts = np.array(pts, np.float32)
-        vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
-        vx, vy, x0, y0 = vx[0], vy[0], x0[0], y0[0]
-
-        if abs(vy) < 1e-5:
-            return None
-
-        y1 = int(self.height * 0.78)
-        y2 = int(self.height * 0.55)
-        x1 = int((y1 - y0) * vx / vy + x0)
-        x2 = int((y2 - y0) * vx / vy + x0)
-
-        if debug:
-            cv2.line(dbg, (x1,y1), (x2,y2), (0,0,255), 3)
-            for y in ys:
-                cv2.line(dbg, (0,y), (self.width,y), (255,0,0), 1)
-            k = float(vx/vy)
-            angle = np.degrees(math.atan(k))
-            text_y = 40
-            step_y = 20
-            cv2.putText(dbg, f"angle={angle:.1f}", (20,text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-            text_y=text_y+step_y
-            cv2.putText(dbg, f"vx={vx:.2f}", (20,text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-            text_y=text_y+step_y
-            cv2.putText(dbg, f"vy={vy:.1f}", (20,text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-            text_y=text_y+step_y
-            cv2.putText(dbg, f"k=vx/vy={k:.2f}", (20,text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-            angle_rad = math.atan(k)
-            text_y=text_y+step_y
-            cv2.putText(dbg, f"angle_rad=math.atan(k)={angle_rad:.2f}", (20,text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-            self.pub_debug.publish(self.bridge.cv2_to_imgmsg(dbg, "bgr8"))
-
-
-        #return (x1, y1), (x2, y2)
-        return (x1,y1,x2,y2), float(vx/vy), float(x0 - (vx/vy)*y0)
     def detect_line_fast(self, binary):
         t0 = time.perf_counter()
 
@@ -234,12 +149,7 @@ class ImageLineProcessingOptimized:
 
         t1 = time.perf_counter()
 
-        # ---------- RGB -> HSV ----------
-
-        # b = roi[:,:,0]
-        # g = roi[:,:,1]
-        # r = roi[:,:,2]
-
+        # --------------------
 
         t2 = time.perf_counter()
 
@@ -307,9 +217,14 @@ class ImageProcessingNode(DTROS):
         self.bridge = CvBridge()
         self.frame_id = 0
 
-         # ==================================================
+        self.process_type = rospy.get_param("/process_type", "lines")
+
+
+        # ==================================================
         # Common params
         # ==================================================
+        self.controller_type = rospy.get_param("/controller_type", "pid")
+
         self.controller_type = rospy.get_param("/controller_type", "pid")
 
         self.max_linear_velocity = rospy.get_param(
@@ -425,6 +340,39 @@ class ImageProcessingNode(DTROS):
         rospy.loginfo(
             f"Loaded controller: {self.controller_type}"
         )
+
+
+        self.yellow = None
+        self.white = None
+        width = 640
+        height = 480
+        # ==================================================
+        # ImageProcess selection
+        # ==================================================
+        if self.process_type == "lines":
+            self.yellow = ImageLineProcessingOptimized(width, height, ColorLine.yellow)
+            self.white  = ImageLineProcessingOptimized(width, height, ColorLine.white)
+            
+        elif self.process_type == "haf":
+            self.yellow = HoughLineProcessing(width, height, ColorLine.yellow)
+            self.white  = HoughLineProcessing(width, height, ColorLine.white)
+
+        elif self.process_type == "win":
+            self.yellow = SlidingWindowLineProcessing(width, height, ColorLine.yellow)
+            self.white  = SlidingWindowLineProcessing(width, height, ColorLine.white)
+
+        elif self.process_type == "con":
+            self.yellow = ContourLineProcessing(width, height, ColorLine.yellow)
+            self.white  = ContourLineProcessing(width, height, ColorLine.white)
+
+        else:
+            raise ValueError(
+                f"Unknown process_type: {self.process_type}"
+            )
+
+        rospy.loginfo(
+            f"Loaded image process type: {self.process_type}"
+        )
         
         self.sub = rospy.Subscriber("/autobot06/camera_node/image/compressed", CompressedImage, self.callback, queue_size=1)
         self.pub_debug = rospy.Publisher("/lane_debug", Image, queue_size=1)
@@ -432,33 +380,13 @@ class ImageProcessingNode(DTROS):
         self.pub = rospy.Publisher("~car_cmd", Twist2DStamped, queue_size=1)
 
 
-        self.yellow = None
-        self.white = None
         self.drive = rospy.get_param("/drive", 0)
-        #self.pid = PIDController(
-        #    kp_horizontal=2.0,
-        #    ki_horizontal=0,
-        #    kd_horizontal=0.5,
-        #    kp_angular=4.9,
-        #    ki_angular=0,
-        #    kd_angular=0.5,
-        #    max_linear_velocity=0.2, #0.25
-        #    max_angular_velocity=8 #1.5
-        #)
+        
         self.process_times = []
+        self.process_cpu = []
         self.control_times = []
-        #self.pid = PIDController(
-        #    kp_horizontal=0.008,
-        #    ki_horizontal=0.0001,
-        #    kd_horizontal=0.0005,
-        #    kp_angular=0.3,
-        #    ki_angular=0.0001,
-        #    kd_angular=0.05,
-        #    max_linear_velocity=0.1, #0.25
-        #    max_angular_velocity=1.0 #1.5
-        #)
-
-        rospy.loginfo("Image processing node started *_*@")
+        
+        rospy.loginfo("Image processing node started!")
 
     def callback(self, msg):
         self.frame_id += 1
@@ -467,20 +395,23 @@ class ImageProcessingNode(DTROS):
         img = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
         h, w, _ = img.shape
 
-        #bird = img #warp_bird_eye(img)
 
-        if self.yellow is None:
-            self.yellow = ImageLineProcessingOptimized(w, h, ColorLine.yellow)
-            self.white  = ImageLineProcessingOptimized(w, h, ColorLine.white)
+        # if self.yellow is None:
+        #     self.yellow = ImageLineProcessingOptimized(w, h, ColorLine.yellow)
+        #     self.white  = ImageLineProcessingOptimized(w, h, ColorLine.white)
 
-        center_x = 335 #w / 2
+        center_x = 335
         bottom_y = int(h * 0.78)
         tp = time.perf_counter()
+        cpu_start = time.process_time()
         y_model = self.yellow.process(img)
         w_model = self.white.process(img)
         process_time = (time.perf_counter() - tp) * 1000.0
+        cpu_used = time.process_time() - cpu_start  # Реальное CPU время
+        cpu_usage_percent = (cpu_used / (time.perf_counter() - tp)) * 100
         self.process_times.append(process_time)
-      
+        self.process_cpu.append(cpu_usage_percent)
+
         horizontal_error = 0.0
         angular_error = 0.0
         valid = False
@@ -545,7 +476,9 @@ class ImageProcessingNode(DTROS):
         if (self.frame_id == 22 or self.frame_id == 21):
             m_process = sum(self.process_times)/len(self.process_times)
             m_control = sum(self.control_times)/len(self.control_times)
-            rospy.loginfo(f"m_process {m_process:.2f} m_control {m_control:.2f}")  
+            m_cpu = sum(self.process_cpu)/len(self.process_cpu)
+
+            rospy.loginfo(f"m_process {m_process:.2f} m_control {m_control:.2f} m_cpu {m_cpu:.2f}")  
         dbg = self.yellow.draw(img, y_model, (0,255,255))
         dbg = self.white.draw(dbg, w_model, (255,255,255), int(lane_center), int(center_x))
         text_y = 40
